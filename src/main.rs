@@ -62,7 +62,7 @@ impl BitSet {
     fn push_u32(&mut self, x: u32) {
         for i in 0..32 {
             let mask = 1 << i;
-            let bit = (x | mask).min(1) as u8;
+            let bit = (x & mask).min(1) as u8;
             self.push_bit(bit)
         }
     }
