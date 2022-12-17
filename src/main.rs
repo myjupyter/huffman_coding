@@ -1,7 +1,9 @@
 use std::{
     cmp::{Eq, Ord, Ordering},
     collections::{BinaryHeap, HashMap},
-    env, fs,
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
     ops::Add,
     path,
 };
@@ -34,7 +36,18 @@ impl BitSet {
         }
     }
 
-    fn push(&mut self, bit: u8) {
+    fn from(bytes: &[u8]) -> Self {
+        BitSet {
+            bytes: Vec::<u8>::from(bytes),
+            pos: 8 * bytes.len() as u64,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn push_bit(&mut self, bit: u8) {
         let i = (self.pos / 8) as usize;
         let r = self.pos % 8;
         if i == self.bytes.len() {
@@ -46,34 +59,43 @@ impl BitSet {
         self.pos += 1;
     }
 
-    fn to_string(self) -> String {
-        let mut s = String::new();
-        for i in 0..self.pos {
-            s.push(match self.get(i as usize) {
-                1 => '1',
-                0 => '0',
-                _ => '0',
-            });
+    fn push_u32(&mut self, x: u32) {
+        for i in 0..32 {
+            let mask = 1 << i;
+            let bit = (x | mask).min(1) as u8;
+            self.push_bit(bit)
         }
-        return s;
     }
 
-    fn concat(mut self, rhs: BitSet) -> BitSet {
-        for i in 0..rhs.pos {
-            self.push(rhs.get(i as usize))
-        }
-        self
+    fn raw_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
-    fn get(&self, index: usize) -> u8 {
+    fn get_bit(&self, index: usize) -> u8 {
         let i = index / 8;
         let r = index % 8;
         let mask = 1 << r;
-        if (self.bytes[i] & mask) == 0 {
-            0
-        } else {
-            1
+        (self.bytes[i] & mask).min(1)
+    }
+
+    fn push_back(&mut self, rhs: BitSet) {
+        for i in 0..rhs.pos {
+            self.push_bit(rhs.get_bit(i as usize))
         }
+    }
+}
+
+impl ToString for BitSet {
+    fn to_string(&self) -> String {
+        let mut s = String::new();
+        for i in 0..self.pos {
+            s.push(match self.get_bit(i as usize).min(1) {
+                1 => '1',
+                0 => '0',
+                _ => panic!(""),
+            });
+        }
+        return s;
     }
 }
 
@@ -174,6 +196,7 @@ impl Node<Pair> {
             data: v,
         }
     }
+
     fn combine(self, other: Self) -> Self {
         let data = self.data.clone() + other.data.clone();
         Self {
@@ -182,32 +205,52 @@ impl Node<Pair> {
             data,
         }
     }
+
     fn encode_chars(&self) -> HashMap<char, BitSet> {
         let mut encoded = HashMap::<char, BitSet>::new();
-        self.visit(&mut encoded, BitSet::new());
+        self.visit(BitSet::new(), &mut |data: Pair, code: BitSet| {
+            encoded.insert(data.1, code);
+        });
         encoded
     }
 
-    fn visit(&self, encoded: &mut HashMap<char, BitSet>, code: BitSet) {
+    fn encode_tree(&self) -> BitSet {
+        let mut encoded_tree = BitSet::new();
+        self.encode_node(&mut encoded_tree, &mut |data: Pair, code: &mut BitSet| {
+            code.push_back(BitSet::from(&[(data.1 as u8)]));
+        });
+        encoded_tree
+    }
+
+    fn visit(&self, code: BitSet, visitor_fn: &mut impl FnMut(Pair, BitSet)) {
         if self.right == None && self.left == None {
-            encoded.insert(self.data.1, code);
+            visitor_fn(self.data.clone(), code.clone());
             return;
         }
-        _ = match &self.left {
-            &Some(ref left_node) => {
-                let mut left_node_code = code.clone();
-                left_node_code.push(0);
-                left_node.visit(encoded, left_node_code);
-            }
-            &None => (),
+        if let &Some(ref left_node) = &self.left {
+            let mut left_node_code = code.clone();
+            left_node_code.push_bit(0);
+            left_node.visit(left_node_code, visitor_fn);
         };
-        _ = match &self.right {
-            &Some(ref right_node) => {
-                let mut right_node_code = code.clone();
-                right_node_code.push(1);
-                right_node.visit(encoded, right_node_code);
-            }
-            &None => (),
+        if let &Some(ref right_node) = &self.right {
+            let mut right_node_code = code.clone();
+            right_node_code.push_bit(1);
+            right_node.visit(right_node_code, visitor_fn);
+        };
+    }
+
+    fn encode_node(&self, code: &mut BitSet, visitor_fn: &mut impl FnMut(Pair, &mut BitSet)) {
+        if self.right == None && self.left == None {
+            code.push_bit(1);
+            visitor_fn(self.data.clone(), code);
+            return;
+        }
+        code.push_bit(0);
+        if let &Some(ref left_node) = &self.left {
+            left_node.encode_node(code, visitor_fn);
+        };
+        if let &Some(ref right_node) = &self.right {
+            right_node.encode_node(code, visitor_fn);
         };
     }
 }
@@ -309,15 +352,50 @@ fn build_huffman_tree(char_freq_table: HashMap<char, u64>) -> Option<Node<Pair>>
     heap.pop()
 }
 
-fn encode_text(text: String, huffman_codes: HashMap<char, BitSet>) -> BitSet {
+fn encode_data(text: &String, huffman_codes: HashMap<char, BitSet>) -> BitSet {
     let mut text_bit_set = BitSet::new();
     for c in text.chars() {
-        text_bit_set = text_bit_set.concat(huffman_codes[&c].clone());
+        text_bit_set.push_back(huffman_codes[&c].clone());
     }
     text_bit_set
 }
 
-fn compress(from: &path::Path, _: &path::Path) {
+struct CompressedFile {
+    compressed_file_size: u32,
+    header_size: u32,
+    uncomporessed_file_size: u32,
+    tree: BitSet,
+    data: BitSet,
+}
+
+impl CompressedFile {
+    fn new(original_file_size: u32, tree: BitSet, data: BitSet) -> Self {
+        return CompressedFile {
+            compressed_file_size: 12 + (tree.len() as u32) + (data.len() as u32),
+            header_size: 12 + (tree.len() as u32),
+            uncomporessed_file_size: original_file_size,
+            tree,
+            data,
+        };
+    }
+
+    fn write(self, file: &path::Path) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(file)
+            .unwrap();
+        let mut encoded_data = BitSet::new();
+        encoded_data.push_u32(self.compressed_file_size);
+        encoded_data.push_u32(self.header_size);
+        encoded_data.push_u32(self.uncomporessed_file_size);
+        encoded_data.push_back(self.tree);
+        encoded_data.push_back(self.data);
+        file.write_all(&encoded_data.raw_bytes()).unwrap();
+    }
+}
+
+fn compress(from: &path::Path, to: &path::Path) {
     let ok = fs::read_to_string(from);
     let data: String;
     match ok {
@@ -326,12 +404,19 @@ fn compress(from: &path::Path, _: &path::Path) {
     }
     let char_freq_table = count_frequency(&data);
     let huffman_codes: HashMap<char, BitSet>;
+    let encoded_tree: BitSet;
+    let encoded_data: BitSet;
     match build_huffman_tree(char_freq_table) {
-        Some(root) => huffman_codes = root.encode_chars(),
+        Some(root) => {
+            huffman_codes = root.encode_chars();
+            encoded_tree = root.encode_tree();
+            encoded_data = encode_data(&data, huffman_codes);
+        }
         None => panic!("binary heap is empty"),
     }
-    let text_bit_set = encode_text(data, huffman_codes);
-    println!("{}", text_bit_set.to_string());
+    let original_file_size = data.len() as u32;
+    let compressed_file = CompressedFile::new(original_file_size, encoded_tree, encoded_data);
+    compressed_file.write(to);
 }
 
 fn decompress(_: &path::Path, _: &path::Path) {
